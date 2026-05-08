@@ -35,6 +35,9 @@ type ScanReaderOptions struct {
 	SkipUnknownType []string         `mapstructure:"skip_unknown_type" default:"[]"`
 	// MaxRetries controls how many times to retry on connection failure (0 = no retry).
 	MaxRetries int `mapstructure:"max_retries" default:"3"`
+	// DumpThrottleMs adds a sleep of this many milliseconds between each dump
+	// batch to reduce network/CPU pressure on the source. 0 = no throttle.
+	DumpThrottleMs int `mapstructure:"dump_throttle_ms" default:"0"`
 }
 
 type dbKey struct {
@@ -333,6 +336,15 @@ func (r *scanStandaloneReader) dumpAndRestore() {
 			if !batch[i].hasSelect {
 				nowDbId = batch[i].dbId
 				break
+			}
+		}
+
+		// Throttle source reads to reduce network/CPU pressure.
+		if r.opts.DumpThrottleMs > 0 {
+			select {
+			case <-r.ctx.Done():
+				break
+			case <-time.After(time.Duration(r.opts.DumpThrottleMs) * time.Millisecond):
 			}
 		}
 	}
