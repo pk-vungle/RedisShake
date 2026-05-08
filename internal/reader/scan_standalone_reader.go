@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"RedisShake/internal/client"
 	"RedisShake/internal/client/proto"
@@ -32,6 +33,8 @@ type ScanReaderOptions struct {
 	PreferReplica   bool             `mapstructure:"prefer_replica" default:"false"`
 	Count           int              `mapstructure:"count" default:"1"`
 	SkipUnknownType []string         `mapstructure:"skip_unknown_type" default:"[]"`
+	// MaxRetries controls how many times to retry on connection failure (0 = no retry).
+	MaxRetries int `mapstructure:"max_retries" default:"3"`
 }
 
 type dbKey struct {
@@ -39,21 +42,14 @@ type dbKey struct {
 	key string
 }
 
-type needRestoreItem struct {
-	dbId int
-	key  string
-}
-
 type scanStandaloneReader struct {
-	ctx             context.Context
-	dbs             []int
-	opts            *ScanReaderOptions
-	ch              chan *entry.Entry
-	needDumpQueue   *utils.UniqueQueue
-	needRestoreChan chan *needRestoreItem
-	dumpClient      *client.Redis
-	subWG           sync.WaitGroup
-	isValkey        bool
+	ctx           context.Context
+	dbs           []int
+	opts          *ScanReaderOptions
+	ch            chan *entry.Entry
+	needDumpQueue *utils.UniqueQueue
+	subWG         sync.WaitGroup
+	isValkey      bool
 
 	stat struct {
 		Name              string `json:"name"`
@@ -71,8 +67,7 @@ func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reade
 	r.opts = opts
 	r.ch = make(chan *entry.Entry, 1024)
 	r.stat.Name = "reader_" + strings.Replace(opts.Address, ":", "_", -1)
-	r.needDumpQueue = utils.NewUniqueQueue(100000000)     // cache 100000000 keys
-	r.needRestoreChan = make(chan *needRestoreItem, 1024) // inflight 1024 keys
+	r.needDumpQueue = utils.NewUniqueQueue(100000000) // cache 100000000 keys
 	log.Infof("[%s] scanStandaloneReader init finished. dbs=[%v]", r.stat.Name, r.dbs)
 	return r
 }
@@ -87,8 +82,7 @@ func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entr
 	if r.opts.Scan {
 		go r.scan()
 	}
-	go r.dump()
-	go r.restore()
+	go r.dumpAndRestore()
 	return []chan *entry.Entry{r.ch}
 }
 
@@ -151,9 +145,32 @@ func (r *scanStandaloneReader) subscribe() {
 	}
 }
 
+func (r *scanStandaloneReader) connectWithRetry(name string) *client.Redis {
+	var lastErr error
+	for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
+		if attempt > 0 {
+			waitTime := time.Duration(attempt) * 5 * time.Second
+			log.Warnf("[%s] %s connection failed (attempt %d/%d): %v, retrying in %v...", r.stat.Name, name, attempt, r.opts.MaxRetries, lastErr, waitTime)
+			select {
+			case <-r.ctx.Done():
+				log.Panicf("[%s] context cancelled during %s reconnect", r.stat.Name, name)
+			case <-time.After(waitTime):
+			}
+		}
+		c, err := client.NewRedisClientSafe(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
+		if err == nil {
+			return c
+		}
+		lastErr = err
+	}
+	log.Panicf("[%s] %s connection failed after %d retries: %v", r.stat.Name, name, r.opts.MaxRetries, lastErr)
+	return nil
+}
+
 func (r *scanStandaloneReader) scan() {
-	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
+	c := r.connectWithRetry("scan")
 	defer c.Close()
+
 	dbs := r.dbs
 	if len(r.dbs) == 0 {
 		c.Send("info", "keyspace")
@@ -163,6 +180,7 @@ func (r *scanStandaloneReader) scan() {
 		}
 		dbs = utils.ParseDBs(info.(string))
 	}
+
 	for _, dbId := range dbs {
 		if dbId != 0 {
 			reply := c.DoWithStringReply("SELECT", strconv.Itoa(dbId))
@@ -182,8 +200,29 @@ func (r *scanStandaloneReader) scan() {
 			default:
 			}
 
+			// Retry SCAN at the current cursor on transient connection errors.
 			var keys []string
-			cursor, keys = c.Scan(cursor, count)
+			var scanErr error
+			for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
+				if attempt > 0 {
+					c.Close()
+					c = r.connectWithRetry("scan-retry")
+					if dbId != 0 {
+						if reply := c.DoWithStringReply("SELECT", strconv.Itoa(dbId)); reply != "OK" {
+							log.Panicf("[%s] scan retry SELECT failed. db=[%d]", r.stat.Name, dbId)
+						}
+					}
+				}
+				cursor, keys, scanErr = c.ScanSafe(cursor, count)
+				if scanErr == nil {
+					break
+				}
+				log.Warnf("[%s] SCAN failed (attempt %d/%d): %v", r.stat.Name, attempt+1, r.opts.MaxRetries+1, scanErr)
+			}
+			if scanErr != nil {
+				log.Panicf("[%s] SCAN failed after %d retries: %v", r.stat.Name, r.opts.MaxRetries, scanErr)
+			}
+
 			for _, key := range keys {
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
 			}
@@ -204,80 +243,191 @@ func (r *scanStandaloneReader) scan() {
 	}
 }
 
-func (r *scanStandaloneReader) dump() {
-	nowDbId := 0
-	r.dumpClient = client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
-	r.isValkey = r.dumpClient.IsValkey()
-	log.Infof("[%s] detected server type: %s", r.stat.Name, map[bool]string{true: "Valkey", false: "Redis"}[r.isValkey])
-	// Support prefer_replica=true in both Cluster and Standalone mode
-	if r.opts.PreferReplica {
-		r.dumpClient.Do("READONLY")
-		log.Infof("running dump() in read-only mode")
-	}
-
-	for item := range r.needDumpQueue.Ch {
-		r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
-		dbId := item.(dbKey).db
-		key := item.(dbKey).key
-		if nowDbId != dbId {
-			r.dumpClient.Send("SELECT", strconv.Itoa(dbId))
-			nowDbId = dbId
-		}
-		// dump
-		r.dumpClient.Send("DUMP", key)
-		r.dumpClient.Send("PTTL", key)
-		if len(r.opts.SkipUnknownType) > 0 {
-			r.dumpClient.Send("TYPE", key)
-		}
-		r.needRestoreChan <- &needRestoreItem{dbId, key}
-	}
-	close(r.needRestoreChan)
-	log.Infof("[%s] scanStandaloneReader dump finished.", r.stat.Name)
+// dumpBatchItem tracks a single key within a mini-batch pipeline.
+type dumpBatchItem struct {
+	dbId      int
+	key       string
+	hasSelect bool // true when a SELECT was sent before DUMP for this item
 }
 
-// restore sends RESTORE commands to the target Redis.
-// Note: rdb_restore_command_behavior configuration only applies when RESTORE command is used.
-// For large values exceeding target_redis_proto_max_bulk_len, individual commands (SET, HSET, etc.)
-// are used instead, which may not respect the rdb_restore_command_behavior setting.
-func (r *scanStandaloneReader) restore() {
+// dumpAndRestore replaces the separate dump()+restore() goroutines.
+// It processes keys from needDumpQueue in mini-batches using a pipelined
+// DUMP+PTTL pattern, and retries the entire batch on connection failure.
+//
+// Retry semantics: on any send/receive error the connection is closed,
+// a new one is dialled, and the same batch is re-sent from scratch.
+// Keys that disappear between retries are silently skipped (DUMP returns nil).
+func (r *scanStandaloneReader) dumpAndRestore() {
+	const batchSize = 64
+
+	c := r.connectWithRetry("dump")
+	defer c.Close()
+	r.isValkey = c.IsValkey()
+	log.Infof("[%s] detected server type: %s", r.stat.Name, map[bool]string{true: "Valkey", false: "Redis"}[r.isValkey])
+	if r.opts.PreferReplica {
+		c.Do("READONLY")
+		log.Infof("running dumpAndRestore() in read-only mode")
+	}
+
 	nowDbId := 0
-	for item := range r.needRestoreChan {
-		dbId := item.dbId
-		key := item.key
-		if nowDbId != dbId {
-			reply, err := r.dumpClient.Receive()
-			if err != nil || reply != "OK" {
-				log.Panicf("scanStandaloneReader select db failed. db=[%d]", dbId)
-			}
-			nowDbId = dbId
+
+	for {
+		// Collect a mini-batch from the queue.
+		batch := make([]dumpBatchItem, 0, batchSize)
+		item, ok := <-r.needDumpQueue.Ch
+		if !ok {
+			break
 		}
-		iDump, err1 := r.dumpClient.Receive()
-		iPttl, err2 := r.dumpClient.Receive()
+		r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+		first := item.(dbKey)
+		if nowDbId != first.db {
+			batch = append(batch, dumpBatchItem{dbId: first.db, hasSelect: true})
+			nowDbId = first.db
+		}
+		batch = append(batch, dumpBatchItem{dbId: first.db, key: first.key})
+
+	fillBatch:
+		for len(batch) < batchSize {
+			select {
+			case item, ok := <-r.needDumpQueue.Ch:
+				if !ok {
+					break fillBatch
+				}
+				k := item.(dbKey)
+				if nowDbId != k.db {
+					batch = append(batch, dumpBatchItem{dbId: k.db, hasSelect: true})
+					nowDbId = k.db
+				}
+				batch = append(batch, dumpBatchItem{dbId: k.db, key: k.key})
+			default:
+				break fillBatch
+			}
+		}
+
+		// Process the batch with retry.
+		for attempt := 0; ; attempt++ {
+			err := r.processDumpBatch(c, batch)
+			if err == nil {
+				break
+			}
+			if attempt >= r.opts.MaxRetries {
+				log.Panicf("[%s] dump batch failed after %d retries: %v", r.stat.Name, r.opts.MaxRetries, err)
+			}
+			waitTime := time.Duration(attempt+1) * 5 * time.Second
+			log.Warnf("[%s] dump batch failed (attempt %d/%d): %v, reconnecting in %v...", r.stat.Name, attempt+1, r.opts.MaxRetries+1, err, waitTime)
+			select {
+			case <-r.ctx.Done():
+				log.Panicf("[%s] context cancelled during dump retry", r.stat.Name)
+			case <-time.After(waitTime):
+			}
+			c.Close()
+			c = r.connectWithRetry("dump-retry")
+			if r.opts.PreferReplica {
+				c.Do("READONLY")
+			}
+			// Fresh connection starts at db 0; rebuild SELECT markers for this batch.
+			batch = rebuildBatchSelects(batch)
+		}
+		// Track the last db in this batch so the next batch knows where we are.
+		for i := len(batch) - 1; i >= 0; i-- {
+			if !batch[i].hasSelect {
+				nowDbId = batch[i].dbId
+				break
+			}
+		}
+	}
+	log.Infof("[%s] scanStandaloneReader dumpAndRestore finished.", r.stat.Name)
+	close(r.ch)
+}
+
+// rebuildBatchSelects strips existing SELECT placeholders and re-inserts them
+// assuming the connection starts at db 0 (i.e. after a fresh reconnect).
+func rebuildBatchSelects(batch []dumpBatchItem) []dumpBatchItem {
+	result := make([]dumpBatchItem, 0, len(batch))
+	curDb := 0
+	for _, item := range batch {
+		if item.hasSelect {
+			continue // drop old placeholder, we'll re-insert as needed
+		}
+		if curDb != item.dbId {
+			result = append(result, dumpBatchItem{dbId: item.dbId, hasSelect: true})
+			curDb = item.dbId
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+// processDumpBatch pipelines DUMP+PTTL (and optional TYPE) for all items in
+// the batch, receives responses, and emits entries to r.ch.
+// Returns a non-nil error on any connection failure so the caller can retry.
+func (r *scanStandaloneReader) processDumpBatch(c *client.Redis, batch []dumpBatchItem) error {
+	// Send phase
+	for _, item := range batch {
+		if item.hasSelect {
+			if err := c.SendSafe("SELECT", strconv.Itoa(item.dbId)); err != nil {
+				return fmt.Errorf("SELECT send: %w", err)
+			}
+			continue
+		}
+		if err := c.SendSafe("DUMP", item.key); err != nil {
+			return fmt.Errorf("DUMP send key=[%s]: %w", item.key, err)
+		}
+		if err := c.SendSafe("PTTL", item.key); err != nil {
+			return fmt.Errorf("PTTL send key=[%s]: %w", item.key, err)
+		}
 		if len(r.opts.SkipUnknownType) > 0 {
-			iType, err3 := r.dumpClient.Receive()
+			if err := c.SendSafe("TYPE", item.key); err != nil {
+				return fmt.Errorf("TYPE send key=[%s]: %w", item.key, err)
+			}
+		}
+	}
+
+	// Receive phase
+	for _, item := range batch {
+		if item.hasSelect {
+			reply, err := c.Receive()
+			if err != nil {
+				return fmt.Errorf("SELECT receive: %w", err)
+			}
+			if reply != "OK" {
+				return fmt.Errorf("SELECT reply not OK: %v", reply)
+			}
+			continue
+		}
+
+		iDump, err1 := c.Receive()
+		iPttl, err2 := c.Receive()
+
+		if len(r.opts.SkipUnknownType) > 0 {
+			iType, err3 := c.Receive()
 			if err3 != nil {
-				log.Panicf(err3.Error())
+				return fmt.Errorf("TYPE receive key=[%s]: %w", item.key, err3)
 			}
 			typeStr := iType.(string)
-			// type in SkipUnknownType
 			skip := false
 			for _, skipType := range r.opts.SkipUnknownType {
 				if strings.EqualFold(typeStr, skipType) {
 					skip = true
+					break
 				}
 			}
 			if skip {
-				log.Infof("skip restore key=[%s] type=[%s]", key, typeStr)
+				log.Infof("skip restore key=[%s] type=[%s]", item.key, typeStr)
 				continue
 			}
 		}
+
 		if errors.Is(err1, proto.Nil) {
-			continue // key not exist
-		} else if err1 != nil {
-			log.Panicf(err1.Error())
-		} else if err2 != nil {
-			log.Panicf(err2.Error())
+			continue // key expired/deleted
 		}
+		if err1 != nil {
+			return fmt.Errorf("DUMP receive key=[%s]: %w", item.key, err1)
+		}
+		if err2 != nil {
+			return fmt.Errorf("PTTL receive key=[%s]: %w", item.key, err2)
+		}
+
 		dump := iDump.(string)
 		pttl := 0
 		switch v := iPttl.(type) {
@@ -287,49 +437,49 @@ func (r *scanStandaloneReader) restore() {
 				pttl = 1
 			}
 		case string:
-			log.Panicf("iPttl is string, this should not happen. key=[%s], pttl=[%s]", key, v)
+			return fmt.Errorf("unexpected string pttl for key=[%s]: %s", item.key, v)
 		default:
-			log.Panicf("unexpected type for pttl: %T", iPttl)
+			return fmt.Errorf("unexpected pttl type %T for key=[%s]", iPttl, item.key)
 		}
 
 		if pttl == -2 {
 			continue // key not exist
 		}
 		if pttl == -1 {
-			pttl = 0 // -1 means no expire
+			pttl = 0 // no expire
 		}
+
 		if uint64(len(dump)) > config.Opt.Advanced.TargetRedisProtoMaxBulkLen {
 			log.Warnf("key=[%s] dump len=[%d] exceeds target_redis_proto_max_bulk_len, falling back to individual commands. "+
-				"rdb_restore_command_behavior setting may not work correctly for this key.", key, len(dump))
+				"rdb_restore_command_behavior setting may not work correctly for this key.", item.key, len(dump))
 			typeByte := dump[0]
 			anotherReader := strings.NewReader(dump[1 : len(dump)-10])
-			o := types.ParseObject(anotherReader, typeByte, key, r.isValkey)
+			o := types.ParseObject(anotherReader, typeByte, item.key, r.isValkey)
 			cmdC := o.Rewrite()
 			for cmd := range cmdC {
 				e := entry.NewEntry()
-				e.DbId = dbId
+				e.DbId = item.dbId
 				e.Argv = cmd
 				r.ch <- e
 			}
 			if pttl != 0 {
 				e := entry.NewEntry()
-				e.DbId = dbId
-				e.Argv = []string{"PEXPIRE", key, strconv.Itoa(pttl)}
+				e.DbId = item.dbId
+				e.Argv = []string{"PEXPIRE", item.key, strconv.Itoa(pttl)}
 				r.ch <- e
 			}
 		} else {
-			argv := []string{"RESTORE", key, strconv.Itoa(pttl), dump}
+			argv := []string{"RESTORE", item.key, strconv.Itoa(pttl), dump}
 			if config.Opt.Advanced.RDBRestoreCommandBehavior == "rewrite" {
 				argv = append(argv, "replace")
 			}
 			r.ch <- &entry.Entry{
-				DbId: dbId,
+				DbId: item.dbId,
 				Argv: argv,
 			}
 		}
 	}
-	log.Infof("[%s] scanStandaloneReader restore finished.", r.stat.Name)
-	close(r.ch)
+	return nil
 }
 
 func (r *scanStandaloneReader) Status() interface{} {

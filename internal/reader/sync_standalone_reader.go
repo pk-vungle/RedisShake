@@ -40,6 +40,9 @@ type SyncReaderOptions struct {
 	PreferReplica bool                   `mapstructure:"prefer_replica" default:"false"`
 	TryDiskless   bool                   `mapstructure:"try_diskless" default:"false"`
 	Sentinel      client.SentinelOptions `mapstructure:"sentinel"`
+	// MaxRetries controls how many times to retry on connection failure during
+	// the PSYNC handshake and RDB download phases (0 = no retry).
+	MaxRetries int `mapstructure:"max_retries" default:"3"`
 }
 
 const RDB_EOF_MARKER_LEN = 40
@@ -155,10 +158,50 @@ func (r *syncStandaloneReader) StartReadWithPSync(ctx context.Context) []chan *e
 	r.ctx = ctx
 	r.ch = make(chan *entry.Entry, 1024)
 	go func() {
-		r.sendReplconfListenPort()
-		r.sendPSync()
-		rdbFilePath := r.receiveRDB()
-		startOffset := r.stat.AofReceivedOffset
+		var rdbFilePath string
+		var startOffset int64
+
+		for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
+			if attempt > 0 {
+				waitTime := time.Duration(attempt) * 10 * time.Second
+				log.Warnf("[%s] PSYNC/RDB phase failed (attempt %d/%d), reconnecting in %v...", r.stat.Name, attempt, r.opts.MaxRetries, waitTime)
+				select {
+				case <-r.ctx.Done():
+					close(r.ch)
+					return
+				case <-time.After(waitTime):
+				}
+				r.client = client.NewRedisClientWithRetry(ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica, r.opts.MaxRetries)
+				// Reset RDB stats for the new attempt.
+				r.stat.RdbFileSizeBytes = 0
+				r.stat.RdbReceivedBytes = 0
+				r.stat.RdbSentBytes = 0
+				r.isDiskless = false
+			}
+
+			r.sendReplconfListenPort()
+
+			if err := r.sendPSyncSafe(); err != nil {
+				log.Warnf("[%s] sendPSync failed (attempt %d/%d): %v", r.stat.Name, attempt+1, r.opts.MaxRetries+1, err)
+				if attempt == r.opts.MaxRetries {
+					log.Panicf("[%s] sendPSync failed after %d retries: %v", r.stat.Name, r.opts.MaxRetries, err)
+				}
+				continue
+			}
+
+			var receiveErr error
+			rdbFilePath, receiveErr = r.receiveRDBSafe()
+			if receiveErr != nil {
+				log.Warnf("[%s] receiveRDB failed (attempt %d/%d): %v", r.stat.Name, attempt+1, r.opts.MaxRetries+1, receiveErr)
+				if attempt == r.opts.MaxRetries {
+					log.Panicf("[%s] receiveRDB failed after %d retries: %v", r.stat.Name, r.opts.MaxRetries, receiveErr)
+				}
+				continue
+			}
+			startOffset = r.stat.AofReceivedOffset
+			break
+		}
+
 		go r.sendReplconfAck() // start sent replconf ack
 		go r.receiveAOF()
 		if r.opts.SyncRdb {
@@ -226,6 +269,208 @@ func (r *syncStandaloneReader) checkBgsaveInProgress() {
 			time.Sleep(1 * time.Second)
 		}
 	}
+}
+
+// sendPSyncSafe is the error-returning variant used by the retry loop.
+func (r *syncStandaloneReader) sendPSyncSafe() error {
+	if r.opts.TryDiskless {
+		if err := r.client.SendSafe("REPLCONF", "CAPA", "EOF"); err != nil {
+			return fmt.Errorf("REPLCONF CAPA EOF send: %w", err)
+		}
+		reply, err := r.client.Receive()
+		if err != nil {
+			return fmt.Errorf("REPLCONF CAPA EOF receive: %w", err)
+		}
+		if replyStr, ok := reply.(string); ok && replyStr == "OK" {
+			r.isDiskless = true
+		}
+	}
+	r.checkBgsaveInProgress()
+
+	argv := []interface{}{"PSYNC", "?", "-1"}
+	if config.Opt.Advanced.AwsPSync != "" {
+		argv = []interface{}{config.Opt.Advanced.GetPSyncCommand(r.stat.Address), "?", "-1"}
+	}
+	if err := r.client.SendSafe(argv...); err != nil {
+		return fmt.Errorf("PSYNC send: %w", err)
+	}
+
+	// format: \n\n\n+<reply>\r\n — skip leading newlines (heartbeats)
+	for {
+		select {
+		case <-r.ctx.Done():
+			return fmt.Errorf("context cancelled during PSYNC")
+		default:
+		}
+		b, err := r.client.Peek()
+		if err != nil {
+			return fmt.Errorf("PSYNC peek: %w", err)
+		}
+		if b != '\n' {
+			break
+		}
+		if _, err := r.client.ReadByte(); err != nil {
+			return fmt.Errorf("PSYNC read heartbeat byte: %w", err)
+		}
+	}
+
+	iReply, err := r.client.Receive()
+	if err != nil {
+		return fmt.Errorf("PSYNC receive reply: %w", err)
+	}
+	reply, ok := iReply.(string)
+	if !ok {
+		return fmt.Errorf("PSYNC unexpected reply type: %T", iReply)
+	}
+	parts := strings.Split(reply, " ")
+	if len(parts) < 3 {
+		return fmt.Errorf("PSYNC reply has too few parts: %q", reply)
+	}
+	masterOffset, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return fmt.Errorf("PSYNC parse offset %q: %w", parts[2], err)
+	}
+	r.stat.AofReceivedOffset = int64(masterOffset)
+	return nil
+}
+
+// receiveRDBSafe is the error-returning variant used by the retry loop.
+func (r *syncStandaloneReader) receiveRDBSafe() (string, error) {
+	r.stat.Status = kWaitBgsave
+	timeStart := time.Now()
+
+	for {
+		b, err := r.client.ReadByte()
+		if err != nil {
+			return "", fmt.Errorf("receiveRDB read leading byte: %w", err)
+		}
+		if b == '\n' {
+			continue
+		}
+		if b != '$' {
+			return "", fmt.Errorf("receiveRDB invalid format: expected '$', got %q", string(b))
+		}
+		break
+	}
+	log.Debugf("[%s] source db bgsave finished. timeUsed=[%.2f]s", r.stat.Name, time.Since(timeStart).Seconds())
+
+	marker, err := r.client.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("receiveRDB read marker: %w", err)
+	}
+	marker = strings.TrimSpace(marker)
+
+	r.stat.Status = kReceiveRdb
+
+	if !r.opts.SyncRdb {
+		log.Infof("[%s] sync_rdb is disabled. Receiving and discarding RDB payload (required by replication protocol).", r.stat.Name)
+		if strings.HasPrefix(marker, "EOF") {
+			if err := r.receiveRDBWithDisklessSafe(marker, io.Discard); err != nil {
+				return "", err
+			}
+		} else {
+			if err := r.receiveRDBWithoutDisklessSafe(marker, io.Discard); err != nil {
+				return "", err
+			}
+		}
+		log.Infof("[%s] RDB payload discarded. timeUsed=[%.2f]s", r.stat.Name, time.Since(timeStart).Seconds())
+		return "", nil
+	}
+
+	rdbFilePath, pathErr := filepath.Abs(r.stat.Name + "/dump.rdb")
+	if pathErr != nil {
+		return "", pathErr
+	}
+	rdbFileHandle, openErr := os.OpenFile(rdbFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	if openErr != nil {
+		return "", openErr
+	}
+
+	if strings.HasPrefix(marker, "EOF") {
+		log.Infof("[%s] source db supports diskless sync capability.", r.stat.Name)
+		err = r.receiveRDBWithDisklessSafe(marker, rdbFileHandle)
+	} else {
+		err = r.receiveRDBWithoutDisklessSafe(marker, rdbFileHandle)
+	}
+	_ = rdbFileHandle.Close()
+	if err != nil {
+		_ = os.Remove(rdbFilePath)
+		return "", err
+	}
+	log.Debugf("[%s] save RDB finished. timeUsed=[%.2f]s", r.stat.Name, time.Since(timeStart).Seconds())
+	return rdbFilePath, nil
+}
+
+func (r *syncStandaloneReader) receiveRDBWithDisklessSafe(marker string, wt io.Writer) error {
+	const bufSize int64 = 32 * 1024 * 1024 // 32MB
+	buf := make([]byte, bufSize)
+
+	marker = strings.Split(marker, ":")[1]
+	if len(marker) != RDB_EOF_MARKER_LEN {
+		return fmt.Errorf("invalid EOF marker length: %q", marker)
+	}
+	log.Infof("meet EOF begin marker: %s", marker)
+	bMarker := []byte(marker)
+	var lastBytes []byte
+	for {
+		copy(buf, lastBytes) // copy previous tail bytes to head of buf
+		nread, err := r.client.Read(buf[len(lastBytes):])
+		if err != nil {
+			return fmt.Errorf("read RDB diskless chunk: %w", err)
+		}
+		bufLen := len(lastBytes) + nread
+		nwrite := 0
+		if bufLen >= RDB_EOF_MARKER_LEN && bytes.Equal(buf[bufLen-RDB_EOF_MARKER_LEN:bufLen], bMarker) {
+			log.Infof("meet EOF end marker.")
+			var writeErr error
+			if nwrite, writeErr = wt.Write(buf[:bufLen-RDB_EOF_MARKER_LEN]); writeErr != nil {
+				return fmt.Errorf("write RDB diskless data: %w", writeErr)
+			}
+			r.stat.RdbFileSizeBytes += uint64(nwrite)
+			r.stat.RdbReceivedBytes += uint64(nwrite)
+			break
+		}
+		if bufLen >= RDB_EOF_MARKER_LEN {
+			var writeErr error
+			if nwrite, writeErr = wt.Write(buf[:bufLen-RDB_EOF_MARKER_LEN]); writeErr != nil {
+				return fmt.Errorf("write RDB diskless data: %w", writeErr)
+			}
+			lastBytes = buf[bufLen-RDB_EOF_MARKER_LEN : bufLen]
+		} else {
+			lastBytes = buf[:bufLen]
+		}
+		r.stat.RdbFileSizeBytes += uint64(nwrite)
+		r.stat.RdbReceivedBytes += uint64(nwrite)
+	}
+	return nil
+}
+
+func (r *syncStandaloneReader) receiveRDBWithoutDisklessSafe(marker string, wt io.Writer) error {
+	length, err := strconv.ParseInt(marker, 10, 64)
+	if err != nil {
+		return fmt.Errorf("parse RDB length %q: %w", marker, err)
+	}
+	r.stat.RdbFileSizeBytes = uint64(length)
+
+	remainder := length
+	const bufSize int64 = 32 * 1024 * 1024 // 32MB
+	buf := make([]byte, bufSize)
+	for remainder != 0 {
+		readOnce := bufSize
+		if remainder < readOnce {
+			readOnce = remainder
+		}
+		n, readErr := r.client.Read(buf[:readOnce])
+		if readErr != nil {
+			return fmt.Errorf("read RDB data (remaining=%d): %w", remainder, readErr)
+		}
+		remainder -= int64(n)
+		if _, writeErr := wt.Write(buf[:n]); writeErr != nil {
+			return fmt.Errorf("write RDB data: %w", writeErr)
+		}
+		r.stat.RdbReceivedBytes += uint64(n)
+	}
+	return nil
 }
 
 func (r *syncStandaloneReader) sendPSync() {
