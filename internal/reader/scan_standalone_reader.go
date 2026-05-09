@@ -38,6 +38,11 @@ type ScanReaderOptions struct {
 	// DumpThrottleMs adds a sleep of this many milliseconds between each dump
 	// batch to reduce network/CPU pressure on the source. 0 = no throttle.
 	DumpThrottleMs int `mapstructure:"dump_throttle_ms" default:"0"`
+	// ScanKeyPattern is passed as the MATCH argument to SCAN.
+	// Use when allow_key_prefix covers a small fraction of total keys to avoid
+	// sending DUMP for every key in the dataset. Example: "scc1:*"
+	// Leave empty to scan all keys (default behaviour).
+	ScanKeyPattern string `mapstructure:"scan_key_pattern" default:""`
 }
 
 type dbKey struct {
@@ -216,7 +221,7 @@ func (r *scanStandaloneReader) scan() {
 						}
 					}
 				}
-				cursor, keys, scanErr = c.ScanSafe(cursor, count)
+				cursor, keys, scanErr = c.ScanSafe(cursor, r.opts.ScanKeyPattern, count)
 				if scanErr == nil {
 					break
 				}

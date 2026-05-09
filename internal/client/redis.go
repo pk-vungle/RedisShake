@@ -258,8 +258,14 @@ func (r *Redis) SendSafe(args ...interface{}) error {
 }
 
 // ScanSafe runs a SCAN command and returns an error instead of panicking.
-func (r *Redis) ScanSafe(cursor uint64, count int) (newCursor uint64, keys []string, err error) {
-	if err = r.SendSafe("scan", strconv.FormatUint(cursor, 10), "count", count); err != nil {
+// When match is non-empty it is passed as the MATCH argument (e.g. "scc1:*").
+func (r *Redis) ScanSafe(cursor uint64, match string, count int) (newCursor uint64, keys []string, err error) {
+	args := []interface{}{"scan", strconv.FormatUint(cursor, 10)}
+	if match != "" {
+		args = append(args, "match", match)
+	}
+	args = append(args, "count", count)
+	if err = r.SendSafe(args...); err != nil {
 		return 0, nil, err
 	}
 	reply, err := r.Receive()

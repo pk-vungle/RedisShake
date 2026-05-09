@@ -24,6 +24,9 @@ max_retries = 3            # Number of times to retry the PSYNC handshake and RD
 #max_retries = 3            # number of times to retry on connection failure (0 = no retry); resumes SCAN from last cursor
 #dump_throttle_ms = 0       # milliseconds to sleep between each 64-key dump batch; use to cap source network output
 #                           # e.g. dump_throttle_ms = 50 → ~1,280 keys/sec max throughput
+#scan_key_pattern = ""      # MATCH pattern passed to SCAN; critical when allow_key_prefix covers a small fraction
+#                           # of total keys — avoids DUMP for every non-matching key. e.g. "scc1:*"
+#                           # leave empty to scan all keys (default)
 ## RedisShake uses the TYPE command to get each key's type.
 ## If the type is in this skip list, the key will be skipped.
 #skip_unknown_type = []  # e.g. ["imset", "mbloom", "string", "hash", "list", "set", "zset"]
