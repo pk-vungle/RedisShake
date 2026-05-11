@@ -27,6 +27,8 @@ max_retries = 3            # Number of times to retry the PSYNC handshake and RD
 #scan_key_pattern = ""      # MATCH pattern passed to SCAN; critical when allow_key_prefix covers a small fraction
 #                           # of total keys — avoids DUMP for every non-matching key. e.g. "scc1:*"
 #                           # leave empty to scan all keys (default)
+#need_dump_queue_size = 100000  # per-node scan→dump queue depth; reduce for large clusters to avoid OOM.
+#                               # scan blocks (backpressure) when full — no data lost. Default 100K.
 ## RedisShake uses the TYPE command to get each key's type.
 ## If the type is in this skip list, the key will be skipped.
 #skip_unknown_type = []  # e.g. ["imset", "mbloom", "string", "hash", "list", "set", "zset"]

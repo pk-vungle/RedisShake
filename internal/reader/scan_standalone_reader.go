@@ -43,6 +43,11 @@ type ScanReaderOptions struct {
 	// sending DUMP for every key in the dataset. Example: "scc1:*"
 	// Leave empty to scan all keys (default behaviour).
 	ScanKeyPattern string `mapstructure:"scan_key_pattern" default:""`
+	// NeedDumpQueueSize controls the buffer depth of the internal scan→dump queue
+	// per node. Reducing this dramatically lowers memory usage for large clusters.
+	// The scan goroutine blocks (backpressure) when the queue is full — no data
+	// is lost. Default 100000 (100K). The old hardcoded value was 100M.
+	NeedDumpQueueSize int `mapstructure:"need_dump_queue_size" default:"100000"`
 }
 
 type dbKey struct {
@@ -76,7 +81,11 @@ func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reade
 	r.opts = opts
 	r.ch = make(chan *entry.Entry, 1024)
 	r.stat.Name = "reader_" + strings.Replace(opts.Address, ":", "_", -1)
-	r.needDumpQueue = utils.NewUniqueQueue(100000000) // cache 100000000 keys
+	queueSize := opts.NeedDumpQueueSize
+	if queueSize <= 0 {
+		queueSize = 100000
+	}
+	r.needDumpQueue = utils.NewUniqueQueue(queueSize)
 	log.Infof("[%s] scanStandaloneReader init finished. dbs=[%v]", r.stat.Name, r.dbs)
 	return r
 }
