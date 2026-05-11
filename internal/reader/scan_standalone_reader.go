@@ -66,6 +66,7 @@ type scanStandaloneReader struct {
 		ScanCursor        uint64 `json:"scan_cursor"`
 		ScanPercentByDbId string `json:"scan_percent"`
 		NeedUpdateCount   int64  `json:"need_update_count"`
+		ScanMatchedKeys   int64  `json:"scan_matched_keys"`
 	}
 }
 
@@ -233,6 +234,10 @@ func (r *scanStandaloneReader) scan() {
 
 			for _, key := range keys {
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
+				r.stat.ScanMatchedKeys++
+				if r.stat.ScanMatchedKeys == 1 {
+					log.Infof("[%s] first matched key: db=[%d] key=[%s]", r.stat.Name, dbId, key)
+				}
 			}
 
 			// stat
@@ -246,6 +251,7 @@ func (r *scanStandaloneReader) scan() {
 		}
 	}
 	r.stat.ScanFinished = true
+	log.Infof("[%s] scan complete: matched_keys=[%d]", r.stat.Name, r.stat.ScanMatchedKeys)
 	if !r.opts.KSN {
 		r.needDumpQueue.Close()
 	}
@@ -505,9 +511,9 @@ func (r *scanStandaloneReader) Status() interface{} {
 
 func (r *scanStandaloneReader) StatusString() string {
 	if r.stat.ScanFinished {
-		return fmt.Sprintf("need_update_count=[%d]", r.stat.NeedUpdateCount)
+		return fmt.Sprintf("need_update_count=[%d], matched_keys=[%d]", r.stat.NeedUpdateCount, r.stat.ScanMatchedKeys)
 	}
-	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], need_update_count=[%d]", r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.NeedUpdateCount)
+	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], need_update_count=[%d], matched_keys=[%d]", r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.NeedUpdateCount, r.stat.ScanMatchedKeys)
 }
 
 func (r *scanStandaloneReader) StatusConsistent() bool {
